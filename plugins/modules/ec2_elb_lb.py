@@ -131,11 +131,6 @@ options:
 extends_documentation_fragment:
 - amazon.aws.aws
 - amazon.aws.ec2
-
-requirements:
-- python >= 2.6
-- boto
-
 '''
 
 EXAMPLES = """
@@ -346,56 +341,14 @@ EXAMPLES = """
     tags: {}
 """
 
-import random
 import time
 
 try:
-    import boto
-    import boto.ec2.elb
-    import boto.ec2.elb.attributes
-    import boto.vpc
-    from boto.ec2.elb.healthcheck import HealthCheck
-    from boto.ec2.tag import Tag
+    import botocore
 except ImportError:
-    pass  # Taken care of by ec2.HAS_BOTO
-
-from ansible.module_utils.six import string_types
-from ansible.module_utils._text import to_native
+    pass  # Taken care of by AnsibleAWSModule
 
 from ..module_utils.core import AnsibleAWSModule
-from ..module_utils.ec2 import AnsibleAWSError
-from ..module_utils.ec2 import HAS_BOTO
-from ..module_utils.ec2 import connect_to_aws
-from ..module_utils.ec2 import get_aws_connection_info
-
-
-def _throttleable_operation(max_retries):
-    def _operation_wrapper(op):
-        def _do_op(*args, **kwargs):
-            retry = 0
-            while True:
-                try:
-                    return op(*args, **kwargs)
-                except boto.exception.BotoServerError as e:
-                    if retry < max_retries and e.code in \
-                            ("Throttling", "RequestLimitExceeded"):
-                        retry = retry + 1
-                        time.sleep(min(random.random() * (2 ** retry), 300))
-                        continue
-                    else:
-                        raise
-        return _do_op
-    return _operation_wrapper
-
-
-def _get_vpc_connection(module, region, aws_connect_params):
-    try:
-        return connect_to_aws(boto.vpc, region, **aws_connect_params)
-    except (boto.exception.NoAuthHandlerFound, AnsibleAWSError) as e:
-        module.fail_json_aws(e, 'Failed to connect to AWS')
-
-
-_THROTTLING_RETRIES = 5
 
 
 class ElbManager(object):
@@ -447,7 +400,6 @@ class ElbManager(object):
 
         self.ec2_conn = self._get_ec2_connection()
 
-    @_throttleable_operation(_THROTTLING_RETRIES)
     def ensure_ok(self):
         """Create the ELB"""
         if not self.elb:
@@ -601,7 +553,6 @@ class ElbManager(object):
 
         return info
 
-    @_throttleable_operation(_THROTTLING_RETRIES)
     def _wait_for_elb_removed(self):
         polling_increment_secs = 15
         max_retries = (self.wait_timeout // polling_increment_secs)
@@ -619,7 +570,6 @@ class ElbManager(object):
 
         return status_achieved
 
-    @_throttleable_operation(_THROTTLING_RETRIES)
     def _wait_for_elb_interface_removed(self):
         polling_increment_secs = 15
         max_retries = (self.wait_timeout // polling_increment_secs)
@@ -647,7 +597,6 @@ class ElbManager(object):
 
         return status_achieved
 
-    @_throttleable_operation(_THROTTLING_RETRIES)
     def _get_elb(self):
         elbs = self.elb_conn.get_all_load_balancers()
         for elb in elbs:
@@ -669,7 +618,6 @@ class ElbManager(object):
         except (boto.exception.NoAuthHandlerFound, Exception) as e:
             self.module.fail_json_aws(e, 'Failure while connecting to AWS')
 
-    @_throttleable_operation(_THROTTLING_RETRIES)
     def _delete_elb(self):
         # True if succeeds, exception raised if not
         result = self.elb_conn.delete_load_balancer(name=self.name)
@@ -1237,7 +1185,6 @@ def main():
 
     module = AnsibleAWSModule(
         argument_spec=argument_spec,
-        check_boto3=False,
         mutually_exclusive=[
             ['security_group_ids', 'security_group_names'],
             ['zones', 'subnets'],
@@ -1247,13 +1194,6 @@ def main():
             ['state', 'present', ['zones', 'subnets'], True],
         ],
     )
-
-    if not HAS_BOTO:
-        module.fail_json(msg='boto required for this module')
-
-    region, ec2_url, aws_connect_params = get_aws_connection_info(module)
-    if not region:
-        module.fail_json(msg="Region must be specified as a parameter, in EC2_REGION or AWS_REGION environment variables or in boto configuration file")
 
     name = module.params['name']
     state = module.params['state']
@@ -1310,16 +1250,6 @@ def main():
                          access_logs, stickiness, wait, wait_timeout, tags,
                          region=region, instance_ids=instance_ids, purge_instance_ids=purge_instance_ids,
                          **aws_connect_params)
-
-    # check for unsupported attributes for this version of boto
-    if cross_az_load_balancing and not elb_man._check_attribute_support('cross_zone_load_balancing'):
-        module.fail_json(msg="You must install boto >= 2.18.0 to use the cross_az_load_balancing attribute")
-
-    if connection_draining_timeout and not elb_man._check_attribute_support('connection_draining'):
-        module.fail_json(msg="You must install boto >= 2.28.0 to use the connection_draining_timeout attribute")
-
-    if idle_timeout and not elb_man._check_attribute_support('connecting_settings'):
-        module.fail_json(msg="You must install boto >= 2.33.0 to use the idle_timeout attribute")
 
     if state == 'present':
         elb_man.ensure_ok()
