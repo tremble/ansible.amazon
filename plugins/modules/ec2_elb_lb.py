@@ -349,6 +349,8 @@ except ImportError:
     pass  # Taken care of by AnsibleAWSModule
 
 from ..module_utils.core import AnsibleAWSModule
+from ..module_utils.ec2 import AWSRetry
+from ..module_utils.ec2 import get_ec2_security_group_ids_from_names
 
 
 class ElbManager(object):
@@ -1157,6 +1159,17 @@ class ElbManager(object):
         return "%s:%s%s" % (protocol, self.health_check['ping_port'], path)
 
 
+@AWSRetry.jittered_backoff()
+def _describe_subnets(ec2, subnet_ids):
+    paginator = ec2.get_paginator('describe_subnets')
+    return paginator.paginate(SubnetIds=subnet_ids).build_full_result()['Subnets']
+
+
+@AWSRetry.jittered_backoff()
+def _get_ec2_security_group_ids_from_names(**params):
+    return get_ec2_security_group_ids_from_names(**params)
+
+
 def main():
     argument_spec = dict(
         state=dict(required=True, choices=['present', 'absent']),
@@ -1222,25 +1235,22 @@ def main():
         module.fail_json(msg='wait_timeout maximum is 600 seconds')
 
     if security_group_names:
-        security_group_ids = []
         try:
-            ec2 = connect_to_aws(boto.ec2, region, **aws_connect_params)
-            if subnets:  # We have at least one subnet, ergo this is a VPC
-                vpc_conn = _get_vpc_connection(module=module, region=region, aws_connect_params=aws_connect_params)
-                vpc_id = vpc_conn.get_all_subnets([subnets[0]])[0].vpc_id
-                filters = {'vpc_id': vpc_id}
+            ec2 = module.client('ec2')
+            if subnets:
+                subnet_details = _describe_subnets(ec2, subnets)
+                vpc_ids = set([subnet['VpcId'] for subnet in subnet_details])
+                if length(vpc_ids) > 1:
+                    module.fail_json("Subnets for an ELB may not span multiple VPCs",
+                        subnets=subnet_details, vpc_ids=vpc_ids)
+                vpc_id = vpc_ids.pop()
             else:
-                filters = None
-            grp_details = ec2.get_all_security_groups(filters=filters)
+               vpc_id = None
 
-            for group_name in security_group_names:
-                if isinstance(group_name, string_types):
-                    group_name = [group_name]
-
-                group_id = [str(grp.id) for grp in grp_details if str(grp.name) in group_name]
-                security_group_ids.extend(group_id)
-        except boto.exception.NoAuthHandlerFound as e:
-            module.fail_json_aws(e)
+            security_group_ids = _get_ec2_security_group_ids_from_names(
+                security_group_names, ec2, vpc_id=vpc_id)
+        except (botocore.exceptions.BotoCoreError, botocore.exceptions.ClientError) as e:
+            module.fail_json_aws(e, msg="Failed to convert security group names to IDs")
 
     elb_man = ElbManager(module, name, listeners, purge_listeners, zones,
                          purge_zones, security_group_ids, health_check,
@@ -1249,7 +1259,7 @@ def main():
                          cross_az_load_balancing,
                          access_logs, stickiness, wait, wait_timeout, tags,
                          region=region, instance_ids=instance_ids, purge_instance_ids=purge_instance_ids,
-                         **aws_connect_params)
+                        )
 
     if state == 'present':
         elb_man.ensure_ok()
